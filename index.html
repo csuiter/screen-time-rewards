@@ -54,6 +54,15 @@
       { id: 'finley', name: 'Finley', color: '#EC4899', bgColor: '#FCE7F3', emoji: '💖' },
     ];
 
+    // Firewalla Integration
+    const DEFAULT_FIREWALLA_CONFIG = {
+      enabled: false,
+      bridgeUrl: '', // e.g., http://192.168.1.1:3838
+      apiSecret: '',
+      harperPolicyId: '',
+      finleyPolicyId: '',
+    };
+
     const PARENT_PIN = '1234'; // Default PIN - parents can change this
 
     // Local storage helpers
@@ -101,12 +110,111 @@
       const [showChangePinModal, setShowChangePinModal] = useState(false);
       const [newPin, setNewPin] = useState('');
 
+      // Firewalla state
+      const [firewallaConfig, setFirewallaConfig] = useState(() => loadFromStorage('firewalla_config', DEFAULT_FIREWALLA_CONFIG));
+      const [showFirewallaModal, setShowFirewallaModal] = useState(false);
+      const [firewallaStatus, setFirewallaStatus] = useState({});
+      const [activeScreenTime, setActiveScreenTime] = useState(() => loadFromStorage('active_screen_time', {})); // { childId: { endTime, activity } }
+
       // Save to localStorage when data changes
       useEffect(() => { saveToStorage('screentime_balances', balances); }, [balances]);
       useEffect(() => { saveToStorage('screentime_history', history); }, [history]);
       useEffect(() => { saveToStorage('screentime_submissions', taskSubmissions); }, [taskSubmissions]);
       useEffect(() => { saveToStorage('screentime_requests', screenTimeRequests); }, [screenTimeRequests]);
       useEffect(() => { saveToStorage('parent_pin', parentPin); }, [parentPin]);
+      useEffect(() => { saveToStorage('firewalla_config', firewallaConfig); }, [firewallaConfig]);
+      useEffect(() => { saveToStorage('active_screen_time', activeScreenTime); }, [activeScreenTime]);
+
+      // Firewalla API functions
+      const firewallaApi = async (method, endpoint) => {
+        if (!firewallaConfig.enabled || !firewallaConfig.bridgeUrl) return null;
+        try {
+          const response = await fetch(`${firewallaConfig.bridgeUrl}${endpoint}`, {
+            method,
+            headers: {
+              'Authorization': `Bearer ${firewallaConfig.apiSecret}`,
+              'Content-Type': 'application/json'
+            }
+          });
+          return await response.json();
+        } catch (error) {
+          console.error('Firewalla API error:', error);
+          return { error: error.message };
+        }
+      };
+
+      const checkFirewallaHealth = async () => {
+        if (!firewallaConfig.bridgeUrl) return;
+        try {
+          const response = await fetch(`${firewallaConfig.bridgeUrl}/health`);
+          const data = await response.json();
+          setFirewallaStatus(prev => ({ ...prev, connected: data.status === 'ok' }));
+        } catch {
+          setFirewallaStatus(prev => ({ ...prev, connected: false }));
+        }
+      };
+
+      // Enable internet access for a child (disable blocking policy)
+      const enableInternetAccess = async (childId) => {
+        const policyId = childId === 'harper' ? firewallaConfig.harperPolicyId : firewallaConfig.finleyPolicyId;
+        if (!policyId) return { error: 'No policy ID configured' };
+        return await firewallaApi('POST', `/policy/${policyId}/disable`);
+      };
+
+      // Disable internet access for a child (enable blocking policy)
+      const disableInternetAccess = async (childId) => {
+        const policyId = childId === 'harper' ? firewallaConfig.harperPolicyId : firewallaConfig.finleyPolicyId;
+        if (!policyId) return { error: 'No policy ID configured' };
+        return await firewallaApi('POST', `/policy/${policyId}/enable`);
+      };
+
+      // Start screen time session with Firewalla
+      const startScreenTimeSession = async (childId, minutes, activity) => {
+        if (firewallaConfig.enabled) {
+          const result = await enableInternetAccess(childId);
+          if (result?.error) {
+            alert(`Firewalla error: ${result.error}`);
+            return false;
+          }
+        }
+        const endTime = Date.now() + (minutes * 60 * 1000);
+        setActiveScreenTime(prev => ({
+          ...prev,
+          [childId]: { endTime, activity, minutes }
+        }));
+        return true;
+      };
+
+      // End screen time session
+      const endScreenTimeSession = async (childId) => {
+        if (firewallaConfig.enabled) {
+          await disableInternetAccess(childId);
+        }
+        setActiveScreenTime(prev => {
+          const newState = { ...prev };
+          delete newState[childId];
+          return newState;
+        });
+      };
+
+      // Check for expired sessions
+      useEffect(() => {
+        const interval = setInterval(() => {
+          Object.entries(activeScreenTime).forEach(([childId, session]) => {
+            if (session.endTime && Date.now() >= session.endTime) {
+              endScreenTimeSession(childId);
+            }
+          });
+        }, 10000); // Check every 10 seconds
+        return () => clearInterval(interval);
+      }, [activeScreenTime, firewallaConfig]);
+
+      // Check Firewalla connection on mount
+      useEffect(() => {
+        if (firewallaConfig.enabled) {
+          checkFirewallaHealth();
+        }
+      }, [firewallaConfig.enabled, firewallaConfig.bridgeUrl]);
 
       const currentChild = CHILDREN.find(c => c.id === userMode);
       const pendingSubmissions = taskSubmissions.filter(s => s.status === 'pending');
@@ -210,9 +318,13 @@
       };
 
       // Parent: Handle screen time request
-      const handleScreenTimeRequest = (requestId, approved) => {
+      const handleScreenTimeRequest = async (requestId, approved) => {
         const request = screenTimeRequests.find(r => r.id === requestId);
         if (approved && request) {
+          // Start Firewalla session if enabled
+          const success = await startScreenTimeSession(request.childId, request.minutes, request.activity);
+          if (!success) return;
+
           setBalances(prev => ({
             ...prev,
             [request.childId]: prev[request.childId] - request.minutes
@@ -221,7 +333,7 @@
             id: Date.now(),
             childId: request.childId,
             type: 'spent',
-            description: request.activity,
+            description: request.activity + (firewallaConfig.enabled ? ' 🌐' : ''),
             minutes: -request.minutes,
             emoji: '📱',
             timestamp: new Date()
@@ -684,6 +796,46 @@
                   <button onClick={() => setShowChangePinModal(true)} style={{ padding: '12px 20px', backgroundColor: '#4F46E5', color: 'white', border: 'none', borderRadius: '10px', fontWeight: '600', cursor: 'pointer' }}>Change PIN</button>
                 </div>
 
+                {/* Firewalla Integration */}
+                <div style={{ backgroundColor: 'white', borderRadius: '16px', padding: '20px', marginBottom: '16px', boxShadow: '0 2px 10px rgba(0,0,0,0.06)', border: firewallaConfig.enabled ? '2px solid #10B981' : '2px solid #E5E7EB' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '12px' }}>
+                    <h3 style={{ margin: 0, color: '#374151', fontSize: '16px' }}>🔥 Firewalla Integration</h3>
+                    {firewallaConfig.enabled && (
+                      <span style={{ backgroundColor: firewallaStatus.connected ? '#D1FAE5' : '#FEE2E2', color: firewallaStatus.connected ? '#059669' : '#DC2626', padding: '4px 10px', borderRadius: '12px', fontSize: '12px', fontWeight: '600' }}>
+                        {firewallaStatus.connected ? '● Connected' : '● Offline'}
+                      </span>
+                    )}
+                  </div>
+                  <p style={{ color: '#6B7280', fontSize: '14px', marginBottom: '12px' }}>
+                    {firewallaConfig.enabled
+                      ? 'Firewalla will automatically control internet access when screen time is approved.'
+                      : 'Connect to Firewalla to automatically enable/disable internet access.'}
+                  </p>
+                  <button onClick={() => setShowFirewallaModal(true)} style={{ padding: '12px 20px', backgroundColor: '#F97316', color: 'white', border: 'none', borderRadius: '10px', fontWeight: '600', cursor: 'pointer' }}>
+                    {firewallaConfig.enabled ? 'Edit Settings' : 'Configure Firewalla'}
+                  </button>
+
+                  {/* Active Sessions */}
+                  {Object.keys(activeScreenTime).length > 0 && (
+                    <div style={{ marginTop: '16px', padding: '12px', backgroundColor: '#FEF3C7', borderRadius: '10px' }}>
+                      <h4 style={{ margin: '0 0 8px', color: '#92400E', fontSize: '14px' }}>⏱️ Active Screen Time Sessions</h4>
+                      {Object.entries(activeScreenTime).map(([childId, session]) => {
+                        const child = CHILDREN.find(c => c.id === childId);
+                        const remaining = Math.max(0, Math.ceil((session.endTime - Date.now()) / 60000));
+                        return (
+                          <div key={childId} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '8px 0' }}>
+                            <span>{child.emoji} {child.name}: {session.activity}</span>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                              <span style={{ fontWeight: '600', color: remaining < 5 ? '#DC2626' : '#059669' }}>{remaining} min left</span>
+                              <button onClick={() => endScreenTimeSession(childId)} style={{ padding: '4px 8px', backgroundColor: '#EF4444', color: 'white', border: 'none', borderRadius: '6px', fontSize: '12px', cursor: 'pointer' }}>End</button>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+
                 <div style={{ backgroundColor: 'white', borderRadius: '16px', padding: '20px', boxShadow: '0 2px 10px rgba(0,0,0,0.06)' }}>
                   <h3 style={{ margin: '0 0 12px', color: '#374151', fontSize: '16px' }}>🗑️ Reset Data</h3>
                   <p style={{ color: '#6B7280', fontSize: '14px', marginBottom: '12px' }}>Clear all balances, history, and pending items</p>
@@ -699,6 +851,110 @@
               </div>
             )}
           </div>
+
+          {/* Firewalla Config Modal */}
+          {showFirewallaModal && (
+            <div style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(0,0,0,0.5)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 100, padding: '20px' }} onClick={() => setShowFirewallaModal(false)}>
+              <div style={{ backgroundColor: 'white', borderRadius: '20px', padding: '24px', width: '100%', maxWidth: '420px', maxHeight: '90vh', overflowY: 'auto' }} onClick={e => e.stopPropagation()}>
+                <h2 style={{ margin: '0 0 8px', textAlign: 'center', color: '#374151' }}>🔥 Firewalla Integration</h2>
+                <p style={{ margin: '0 0 20px', textAlign: 'center', color: '#6B7280', fontSize: '14px' }}>Control internet access automatically</p>
+
+                {/* Enable Toggle */}
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '12px', backgroundColor: '#F9FAFB', borderRadius: '10px', marginBottom: '16px' }}>
+                  <span style={{ fontWeight: '500' }}>Enable Firewalla Control</span>
+                  <button
+                    onClick={() => setFirewallaConfig(prev => ({ ...prev, enabled: !prev.enabled }))}
+                    style={{
+                      width: '50px', height: '28px', borderRadius: '14px', border: 'none', cursor: 'pointer',
+                      backgroundColor: firewallaConfig.enabled ? '#10B981' : '#D1D5DB',
+                      position: 'relative', transition: 'background-color 0.2s'
+                    }}
+                  >
+                    <div style={{
+                      width: '24px', height: '24px', borderRadius: '50%', backgroundColor: 'white',
+                      position: 'absolute', top: '2px', left: firewallaConfig.enabled ? '24px' : '2px',
+                      transition: 'left 0.2s', boxShadow: '0 2px 4px rgba(0,0,0,0.2)'
+                    }} />
+                  </button>
+                </div>
+
+                {firewallaConfig.enabled && (
+                  <>
+                    {/* Bridge URL */}
+                    <div style={{ marginBottom: '16px' }}>
+                      <label style={{ display: 'block', marginBottom: '6px', fontWeight: '500', fontSize: '14px' }}>Bridge Server URL</label>
+                      <input
+                        type="url"
+                        placeholder="http://192.168.1.1:3838"
+                        value={firewallaConfig.bridgeUrl}
+                        onChange={(e) => setFirewallaConfig(prev => ({ ...prev, bridgeUrl: e.target.value }))}
+                        style={{ width: '100%', padding: '12px', border: '2px solid #E5E7EB', borderRadius: '10px', fontSize: '14px' }}
+                      />
+                      <p style={{ margin: '4px 0 0', fontSize: '12px', color: '#9CA3AF' }}>IP address of your Firewalla running the bridge server</p>
+                    </div>
+
+                    {/* API Secret */}
+                    <div style={{ marginBottom: '16px' }}>
+                      <label style={{ display: 'block', marginBottom: '6px', fontWeight: '500', fontSize: '14px' }}>API Secret</label>
+                      <input
+                        type="password"
+                        placeholder="screentime2024"
+                        value={firewallaConfig.apiSecret}
+                        onChange={(e) => setFirewallaConfig(prev => ({ ...prev, apiSecret: e.target.value }))}
+                        style={{ width: '100%', padding: '12px', border: '2px solid #E5E7EB', borderRadius: '10px', fontSize: '14px' }}
+                      />
+                      <p style={{ margin: '4px 0 0', fontSize: '12px', color: '#9CA3AF' }}>Must match the API_SECRET in your bridge server</p>
+                    </div>
+
+                    <div style={{ borderTop: '1px solid #E5E7EB', paddingTop: '16px', marginBottom: '16px' }}>
+                      <h4 style={{ margin: '0 0 12px', fontSize: '14px', color: '#374151' }}>Policy IDs (from Firewalla rules)</h4>
+
+                      {/* Harper Policy ID */}
+                      <div style={{ marginBottom: '12px' }}>
+                        <label style={{ display: 'block', marginBottom: '6px', fontWeight: '500', fontSize: '14px' }}>💜 Harper's Block Policy ID</label>
+                        <input
+                          type="text"
+                          placeholder="e.g., 15"
+                          value={firewallaConfig.harperPolicyId}
+                          onChange={(e) => setFirewallaConfig(prev => ({ ...prev, harperPolicyId: e.target.value }))}
+                          style={{ width: '100%', padding: '12px', border: '2px solid #E5E7EB', borderRadius: '10px', fontSize: '14px' }}
+                        />
+                      </div>
+
+                      {/* Finley Policy ID */}
+                      <div style={{ marginBottom: '12px' }}>
+                        <label style={{ display: 'block', marginBottom: '6px', fontWeight: '500', fontSize: '14px' }}>💖 Finley's Block Policy ID</label>
+                        <input
+                          type="text"
+                          placeholder="e.g., 16"
+                          value={firewallaConfig.finleyPolicyId}
+                          onChange={(e) => setFirewallaConfig(prev => ({ ...prev, finleyPolicyId: e.target.value }))}
+                          style={{ width: '100%', padding: '12px', border: '2px solid #E5E7EB', borderRadius: '10px', fontSize: '14px' }}
+                        />
+                      </div>
+
+                      <p style={{ fontSize: '12px', color: '#9CA3AF', backgroundColor: '#F9FAFB', padding: '10px', borderRadius: '8px' }}>
+                        💡 Create "Block Internet" rules in Firewalla for each child's devices, then SSH into Firewalla and run: <code style={{ backgroundColor: '#E5E7EB', padding: '2px 6px', borderRadius: '4px' }}>redis-cli hgetall policy:system</code> to find the policy IDs.
+                      </p>
+                    </div>
+
+                    {/* Test Connection */}
+                    <button
+                      onClick={async () => {
+                        await checkFirewallaHealth();
+                        alert(firewallaStatus.connected ? 'Connected successfully!' : 'Connection failed. Check your settings.');
+                      }}
+                      style={{ width: '100%', padding: '12px', backgroundColor: '#3B82F6', color: 'white', border: 'none', borderRadius: '10px', fontWeight: '600', cursor: 'pointer', marginBottom: '12px' }}
+                    >
+                      🔄 Test Connection
+                    </button>
+                  </>
+                )}
+
+                <button onClick={() => setShowFirewallaModal(false)} style={{ width: '100%', padding: '14px', backgroundColor: '#F3F4F6', border: 'none', borderRadius: '12px', fontWeight: '600', color: '#6B7280', cursor: 'pointer' }}>Done</button>
+              </div>
+            </div>
+          )}
 
           {/* Change PIN Modal */}
           {showChangePinModal && (
